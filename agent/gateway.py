@@ -5,7 +5,8 @@ Command/Decision/GatewayContext retain the lab's public interface.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+import json
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -238,6 +239,7 @@ from kit.mcp.specs import A2A_PEERS, TOOL_SPECS
 from kit.mcp.types import canonicalise_fields, ToolResult
 from kit.world.anchor import Anchor
 from agent.strategy import plan_call, available_call_budget
+from agent.guardrails import scan_for_injected_instructions
 from kit.mcp.a2a import verify_card, verify_delegation, parse_traceparent
 
 
@@ -262,6 +264,9 @@ class Gateway:
         self._cards: dict[str, tuple[str, ...]] = {}
         self._seen_tokens: set[str] = set()
         self._used_write_keys: set[str] = set()
+        self._write_effects: set[tuple[str, str, str]] = set()
+        self._round_costs: dict[int, int] = {}
+        self._pending_rounds: dict[str, int] = {}
         self._provenance: dict[str, tuple[str, int, int, str | None]] = {}
         self._leases: dict[str, tuple[int, int]] = {}
         self._pending: dict[str, tuple[ToolCall, int, int]] = {}
@@ -328,6 +333,11 @@ class Gateway:
             return self.deny(cmd, "peer identity or answer verification failed")
         if "wiki.read" not in self.ctx.scopes:
             return self.deny(cmd, "missing wiki.read scope")
+        for key in ("note", "instruction", "peer_answer"):
+            if isinstance(cmd.args.get(key), str) and scan_for_injected_instructions(cmd.args[key]).suspicious:
+                return Decision(verdict="deny", reason="injected instruction in retrieved content", quarantine=True)
+        if cmd.server == "glossary" and cmd.tool == "define" and cmd.args.get("lang") not in ("vi", "en"):
+            return self.deny(cmd, "glossary.define requires explicit vi or en language")
         act = _learner_identity(self.ctx.act)
         for key in ("act", "learner", "target_learner"):
             if key in cmd.args and _learner_identity(cmd.args[key]) != act:
@@ -356,6 +366,9 @@ class Gateway:
         if spec.is_write and cmd.server == "progress":
             args["anchor"] = args.get("anchor") or args.get("learner")
         if spec.is_write:
+            effect = (cmd.server, cmd.tool, json.dumps(args, sort_keys=True))
+            if effect in self._write_effects:
+                return self.deny(cmd, "write effect already authorised or its outcome is uncertain")
             target = args.get("anchor")
             pin = self._provenance.get(target)
             if not pin or pin[1] != cmd.call_index - 1 or pin[2] != self.ctx.round:
@@ -380,6 +393,9 @@ class Gateway:
             if headers.get("aud") not in (cmd.server, "a2a:" + cmd.server):
                 return self.deny(cmd, "delegation audience does not match this peer")
             token = headers.get("delegation-token")
+            if isinstance(token, str):
+                token = json.loads(token)
+                headers["delegation-token"] = token
             if not isinstance(token, Mapping):
                 return self.deny(cmd, "A2A requires a registry-signed delegation token")
             result = verify_delegation(token, aud="a2a:" + cmd.server,
@@ -409,17 +425,22 @@ class Gateway:
         # Pending reservations only apply while ctx still has the pre-call
         # balance. The arena remains the source of truth after execution.
         reserved = sum(cost for _, cost, balance in self._pending.values() if balance <= self.ctx.credits)
-        if estimated_cost > available_call_budget(self.ctx.credits, self.ctx.round, reserved):
+        allowance = max(10, self.ctx.credits // max(1, 11 - max(1, self.ctx.round)))
+        remaining_round = max(0, allowance - self._round_costs.get(self.ctx.round, 0))
+        if estimated_cost > min(remaining_round, available_call_budget(self.ctx.credits, self.ctx.round, reserved)):
             return self.deny(cmd, "insufficient credits after reserving future rounds")
         if cmd.cmd_id in self._pending:
             return self.deny(cmd, "command id already authorised")
         call = ToolCall(server=server, tool=tool, args=args, fields=fields,
                         headers=headers, lease_id=cmd.lease_id, call_index=cmd.call_index)
         self._pending[cmd.cmd_id] = (call, estimated_cost, self.ctx.credits)
+        self._pending_rounds[cmd.cmd_id] = self.ctx.round
+        self._round_costs[self.ctx.round] = self._round_costs.get(self.ctx.round, 0) + estimated_cost
         if token_id:
             self._seen_tokens.add(token_id)
         if spec.is_write:
             self._used_write_keys.add(headers["idempotency-key"])
+            self._write_effects.add(effect)
             self._provenance.pop(args["anchor"], None)
         if rate:
             self._rates.setdefault(key, []).append(self.ctx.round)
@@ -437,11 +458,15 @@ class Gateway:
         if not pending or pending[0].call_index != cmd.call_index:
             return False
         parsed = result if isinstance(result, ToolResult) else ToolResult.from_dict(result)
-        call = self._pending.pop(cmd.cmd_id)[0]
+        call, estimate, _ = self._pending.pop(cmd.cmd_id)
+        round_no = self._pending_rounds.pop(cmd.cmd_id)
+        self._round_costs[round_no] += parsed.cost - estimate
         key = (call.server, call.tool)
         if not parsed.ok:
             if TOOL_SPECS[key].is_write:
                 self._provenance.pop(call.args.get("anchor"), None)
+                if parsed.error.get("code") in ("conflict", "precondition_missing", "bad_request", "unauthorized"):
+                    self._write_effects.discard((call.server, call.tool, json.dumps(call.args, sort_keys=True)))
             return True
         if call.server == "registry" and call.tool == "provenance" and not parsed.partial and parsed.etag:
             anchor = call.args.get("anchor")

@@ -505,6 +505,8 @@ def plan_call(server: str, tool: str, fields: tuple[str, ...], args: Mapping[str
     n_rows = 1
     if spec.row_weight:
         limit = args.get("limit", 3)
+        if isinstance(limit, str) and limit.isascii() and limit.isdigit() and len(limit) <= 9:
+            limit = int(limit)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("limit must be a positive integer")
         n_rows = min(limit, 3)

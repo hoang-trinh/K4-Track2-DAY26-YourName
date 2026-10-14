@@ -1,28 +1,6 @@
-"""agent — YOUR Task 3 build (FINAL-PLAN.md section 5.1: "the student's
-biggest build"). Five files, each scored differently — read agent/README.md
-first, it maps all five to what each decides and which of the 17 rubric
-classes (CONTRACTS.md section 6.1) each one can save you from.
+"""Defender APIs: gateway, tool policy, guardrails and exchange adapter.
 
-    gateway.py      the control plane: Gateway.decide(cmd) -> Decision
-                     (CONTRACTS.md section 4, exactly)
-    strategy.py      discovery / delegation / caching / replica / budget
-                     policy — building blocks, not wired in by default
-    guardrails.py    grounding (real), injection/redaction/arithmetic
-                     (named stubs), abstention (real, naive)
-    telemetry.py     ctx.emit wrappers — your own side only, never scored
-    prompt.md        the system prompt LAYERED ON TOP of kit.loop.prompt's
-                     harness prompt (not a replacement for it)
-
-Public surface, re-exported for convenience — everything below is YOUR OWN
-code (RULES.md section 1: "you own, entirely: agent/"), written together in
-one pass, so — unlike `kit/`'s subpackages, which degrade import-by-import
-because several are written by other people concurrently (workspace hard
-rule 2) — these four imports are expected to always succeed together:
-
-    from agent import Command, Decision, GatewayContext, Gateway
-    from agent import BudgetPacer, ResultCache, should_delegate
-    from agent import GroundingResult, check_grounding, abstention_policy
-    from agent import Telemetry, RecordingGatewayContext
+Read agent/README.md for trusted callbacks and the kit.loop.Agent integration.
 """
 
 from __future__ import annotations
@@ -112,3 +90,6 @@ if __name__ == "__main__":
     assert decision.verdict == "forward"
 
     print("\nagent/__init__.py import-and-export check passed.")
+
+from agent.defender import AnswerEvidence, DefenderEnvironment
+__all__ += ["AnswerEvidence", "DefenderEnvironment"]
