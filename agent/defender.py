@@ -84,7 +84,18 @@ class AnswerEvidence:
         # Citation anchors are public references. Other fields (including
         # nested values) still undergo private-value and PII checking.
         public_refs = {"cited_anchors", "anchor", "anchors", "w_anchor", "c_anchor", "a", "b", "talk"}
-        serialized = json.dumps({k: v for k, v in answer.items() if k not in public_refs}, ensure_ascii=False, sort_keys=True, default=str)
+        def safe_reference(field, value):
+            if field in ("cited_anchors", "anchors"):
+                return isinstance(value, (list, tuple)) and all(
+                    isinstance(a, str) and a in self._sources for a in value)
+            return isinstance(value, str) and value in self._sources
+
+        # Exemption depends on a validated reference value, never its key alone.
+        validated_refs = {k for k, v in answer.items() if k in public_refs and safe_reference(k, v)}
+        for field in public_refs.intersection(answer):
+            if field not in validated_refs:
+                issues.append("invalid citation reference field: " + field)
+        serialized = json.dumps({k: v for k, v in answer.items() if k not in validated_refs}, ensure_ascii=False, sort_keys=True, default=str)
         private_serialized = json.dumps(answer, ensure_ascii=False, sort_keys=True, default=str)
         if any(value and value in private_serialized for value in self._private):
             issues.append("answer contains private information")

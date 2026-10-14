@@ -249,6 +249,23 @@ def _learner_identity(value: str) -> str:
     return "learner:" + slug if separator and namespace.lower() == "learner" else value
 
 
+def _write_effect(server: str, tool: str, args: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Fingerprint the fields the handler actually uses, not transport aliases."""
+    target = args.get("anchor") or args.get("learner")
+    if (server, tool) == ("progress", "record_mastery"):
+        effect = {"anchor": _learner_identity(target), "concept": args.get("concept"),
+                  "mastery_level": args.get("mastery_level", "practiced")}
+    else:
+        # flag_stale_slide only changes the status of its anchor.
+        effect = {"anchor": target}
+    return server, tool, json.dumps(effect, sort_keys=True)
+
+
+def _query_identity(server: str, tool: str, args: Mapping[str, Any]) -> tuple[str, str, str]:
+    return server, tool, json.dumps(
+        {k: v for k, v in args.items() if k not in ("cursor", "limit")}, sort_keys=True)
+
+
 class Gateway:
     """Pure, synchronous control plane; one instance per duel.
 
@@ -271,7 +288,7 @@ class Gateway:
         self._leases: dict[str, tuple[int, int]] = {}
         self._pending: dict[str, tuple[ToolCall, int, int]] = {}
         self._rates: dict[tuple[str, str], list[int]] = {}
-        self._partials: dict[tuple[str, str], tuple[dict, str, int]] = {}
+        self._partials: dict[tuple[str, str, str], tuple[str, int]] = {}
         self._history_count = 0
 
     def note_card(self, server: str, card: Mapping[str, Any]) -> bool:
@@ -366,7 +383,7 @@ class Gateway:
         if spec.is_write and cmd.server == "progress":
             args["anchor"] = args.get("anchor") or args.get("learner")
         if spec.is_write:
-            effect = (cmd.server, cmd.tool, json.dumps(args, sort_keys=True))
+            effect = _write_effect(cmd.server, cmd.tool, args)
             if effect in self._write_effects:
                 return self.deny(cmd, "write effect already authorised or its outcome is uncertain")
             target = args.get("anchor")
@@ -408,14 +425,10 @@ class Gateway:
             token_id = token["token_id"]
         server, tool, fields, args, estimated_cost = plan_call(cmd.server, cmd.tool, cmd.fields, args)
         key = (server, tool)
-        partial = self._partials.get(key)
+        partial = self._partials.get(_query_identity(server, tool, args))
         if "cursor" in args:
-            if not partial or partial[2] != self.ctx.round or str(args["cursor"]) != partial[1]:
+            if not partial or partial[1] != self.ctx.round or str(args["cursor"]) != partial[0]:
                 return self.deny(cmd, "continuation was not returned for this request")
-            original_args = {k: v for k, v in partial[0].items() if k not in ("cursor", "limit")}
-            current_args = {k: v for k, v in args.items() if k not in ("cursor", "limit")}
-            if original_args != current_args:
-                return self.deny(cmd, "continuation belongs to a different query")
         rate = TOOL_SPECS[key].rate_limit
         if rate:
             count, window = rate
@@ -466,7 +479,7 @@ class Gateway:
             if TOOL_SPECS[key].is_write:
                 self._provenance.pop(call.args.get("anchor"), None)
                 if parsed.error.get("code") in ("conflict", "precondition_missing", "bad_request", "unauthorized"):
-                    self._write_effects.discard((call.server, call.tool, json.dumps(call.args, sort_keys=True)))
+                    self._write_effects.discard(_write_effect(call.server, call.tool, call.args))
             return True
         if call.server == "registry" and call.tool == "provenance" and not parsed.partial and parsed.etag:
             anchor = call.args.get("anchor")
@@ -474,10 +487,11 @@ class Gateway:
                 self._provenance[anchor] = (parsed.etag, call.call_index, self.ctx.round, parsed.replica)
         if parsed.lease_id and key == ("slides", "query"):
             self._leases[parsed.lease_id] = (call.call_index, self.ctx.round)
+        query_key = _query_identity(call.server, call.tool, call.args)
         if parsed.partial and parsed.continuation is not None:
-            self._partials[key] = (dict(call.args), parsed.continuation, self.ctx.round)
+            self._partials[query_key] = (parsed.continuation, self.ctx.round)
         else:
-            self._partials.pop(key, None)
+            self._partials.pop(query_key, None)
         return True
 
     def _sync_history(self) -> None:
