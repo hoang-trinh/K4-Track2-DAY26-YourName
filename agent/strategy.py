@@ -474,3 +474,45 @@ if __name__ == "__main__":
         assert got == want, (case, got, want)
 
     print("\nAll agent/strategy.py demos passed.")
+
+
+def plan_call(server: str, tool: str, fields: tuple[str, ...], args: Mapping[str, Any]):
+    """Return (server, tool, mask, args, worst-case cost) for a bounded call.
+
+    Explicit fields are retained or denied, never silently dropped. Wildcard
+    masks use defaults; catalogue defaults are narrowed to names/terms.
+    Search-to-query migration changes the incompatible snippet field to body.
+    """
+    from kit.mcp.specs import cost
+    from kit.mcp.types import canonicalise_fields
+    mask = canonicalise_fields(fields)
+    if "*" in mask and mask != ("*",):
+        raise ValueError("wildcard must be the entire field mask")
+    successor = successor_of(server, tool)
+    if successor:
+        server, tool = successor
+        mask = tuple(sorted({"body" if f == "snippet" else f for f in mask if f != "anchor"}))
+    spec = TOOL_SPECS[(server, tool)]
+    if mask == ("*",) or not mask:
+        mask = spec.default_fields
+        if (server, tool) == ("registry", "list_servers"):
+            mask = ("name",)
+        elif (server, tool) == ("glossary", "list_terms"):
+            mask = ("term",)
+    if any(f not in spec.all_fields for f in mask):
+        raise ValueError("unknown response field")
+    planned_args = dict(args)
+    n_rows = 1
+    if spec.row_weight:
+        limit = args.get("limit", 3)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        n_rows = min(limit, 3)
+        planned_args["limit"] = n_rows
+    return server, tool, mask, planned_args, cost(server, tool, fields=mask, n_rows=n_rows)
+
+
+def available_call_budget(credits: int, round_no: int, reserved: int = 0) -> int:
+    """Reserve three credits per future round; use the live arena balance."""
+    future_rounds = max(0, ROUNDS_PER_DUEL - max(1, round_no))
+    return max(0, credits - reserved - 3 * future_rounds)

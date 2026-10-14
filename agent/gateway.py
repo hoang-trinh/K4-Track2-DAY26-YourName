@@ -235,7 +235,9 @@ class GatewayContext(Protocol):
 
 
 from kit.mcp.specs import A2A_PEERS, TOOL_SPECS
-from kit.mcp.types import canonicalise_fields
+from kit.mcp.types import canonicalise_fields, ToolResult
+from kit.world.anchor import Anchor
+from agent.strategy import plan_call, available_call_budget
 from kit.mcp.a2a import verify_card, verify_delegation, parse_traceparent
 
 
@@ -259,6 +261,13 @@ class Gateway:
         self._denied_cmd_ids: set[str] = set()
         self._cards: dict[str, tuple[str, ...]] = {}
         self._seen_tokens: set[str] = set()
+        self._used_write_keys: set[str] = set()
+        self._provenance: dict[str, tuple[str, int, int, str | None]] = {}
+        self._leases: dict[str, tuple[int, int]] = {}
+        self._pending: dict[str, tuple[ToolCall, int, int]] = {}
+        self._rates: dict[tuple[str, str], list[int]] = {}
+        self._partials: dict[tuple[str, str], tuple[dict, str, int]] = {}
+        self._history_count = 0
 
     def note_card(self, server: str, card: Mapping[str, Any]) -> bool:
         """Trusted registry callback. Verify raw signed cards cryptographically.
@@ -286,6 +295,7 @@ class Gateway:
         self._telemetry.decision_seen(cmd)
         # Canonicalised commands are trusted structurally; their contents are not.
         try:
+            self._sync_history()
             decision = self._decide(cmd)
         except (ValueError, TypeError, KeyError, AttributeError):
             decision = Decision(verdict="deny", reason="malformed tool arguments or headers")
@@ -338,6 +348,29 @@ class Gateway:
                 return self.deny(cmd, "write requires If-Match and Idempotency-Key")
         if spec.needs_lease and (not cmd.lease_id or cmd.lease_id not in self.ctx.leases):
             return self.deny(cmd, "get_frame requires a live lease")
+        if spec.needs_lease and cmd.lease_id in self._leases:
+            minted, round_no = self._leases[cmd.lease_id]
+            if round_no != self.ctx.round or not 0 < cmd.call_index - minted <= 3:
+                return self.deny(cmd, "lease expired or belongs to a previous round")
+        args = dict(cmd.args)
+        if spec.is_write and cmd.server == "progress":
+            args["anchor"] = args.get("anchor") or args.get("learner")
+        if spec.is_write:
+            target = args.get("anchor")
+            pin = self._provenance.get(target)
+            if not pin or pin[1] != cmd.call_index - 1 or pin[2] != self.ctx.round:
+                return self.deny(cmd, "write requires immediately preceding successful provenance")
+            if headers["if-match"] != pin[0]:
+                return self.deny(cmd, "If-Match does not match trusted provenance")
+            if headers["idempotency-key"] in self._used_write_keys:
+                return self.deny(cmd, "write idempotency key was already authorised")
+        if isinstance(anchor, str):
+            parsed_anchor = Anchor.parse(anchor)
+            if parsed_anchor.rev:
+                headers["mcp-replica"] = parsed_anchor.rev
+            pin = self._provenance.get(anchor)
+            if pin and pin[2] == self.ctx.round and pin[3] and parsed_anchor.rev and pin[3] != parsed_anchor.rev:
+                return self.deny(cmd, "provenance and requested anchor replica disagree")
         token_id = None
         if cmd.kind == "a2a":
             skills = self._cards.get(cmd.server, ())
@@ -357,17 +390,85 @@ class Gateway:
             if "traceparent" in headers:
                 parse_traceparent(headers["traceparent"])
             token_id = token["token_id"]
-        fields = canonicalise_fields(cmd.fields)
-        if "*" in fields and fields != ("*",):
-            return self.deny(cmd, "wildcard must be the entire field mask")
-        if fields != ("*",) and any(f not in spec.all_fields for f in fields):
-            return self.deny(cmd, "unknown response field")
-        call = ToolCall(server=cmd.server, tool=cmd.tool, args=dict(cmd.args),
-                        fields=fields, headers=headers, lease_id=cmd.lease_id,
-                        call_index=cmd.call_index)
+        server, tool, fields, args, estimated_cost = plan_call(cmd.server, cmd.tool, cmd.fields, args)
+        key = (server, tool)
+        partial = self._partials.get(key)
+        if "cursor" in args:
+            if not partial or partial[2] != self.ctx.round or str(args["cursor"]) != partial[1]:
+                return self.deny(cmd, "continuation was not returned for this request")
+            original_args = {k: v for k, v in partial[0].items() if k not in ("cursor", "limit")}
+            current_args = {k: v for k, v in args.items() if k not in ("cursor", "limit")}
+            if original_args != current_args:
+                return self.deny(cmd, "continuation belongs to a different query")
+        rate = TOOL_SPECS[key].rate_limit
+        if rate:
+            count, window = rate
+            recent = [rnd for rnd in self._rates.get(key, []) if rnd > self.ctx.round - window]
+            if len(recent) >= count:
+                return self.deny(cmd, "tool rate window exhausted")
+        # Pending reservations only apply while ctx still has the pre-call
+        # balance. The arena remains the source of truth after execution.
+        reserved = sum(cost for _, cost, balance in self._pending.values() if balance <= self.ctx.credits)
+        if estimated_cost > available_call_budget(self.ctx.credits, self.ctx.round, reserved):
+            return self.deny(cmd, "insufficient credits after reserving future rounds")
+        if cmd.cmd_id in self._pending:
+            return self.deny(cmd, "command id already authorised")
+        call = ToolCall(server=server, tool=tool, args=args, fields=fields,
+                        headers=headers, lease_id=cmd.lease_id, call_index=cmd.call_index)
+        self._pending[cmd.cmd_id] = (call, estimated_cost, self.ctx.credits)
         if token_id:
             self._seen_tokens.add(token_id)
-        return Decision(verdict="rewrite" if headers != cmd.headers or fields != cmd.fields else "forward", call=call)
+        if spec.is_write:
+            self._used_write_keys.add(headers["idempotency-key"])
+            self._provenance.pop(args["anchor"], None)
+        if rate:
+            self._rates.setdefault(key, []).append(self.ctx.round)
+        original = ToolCall(server=cmd.server, tool=cmd.tool, args=cmd.args, fields=cmd.fields,
+                            headers=cmd.headers, lease_id=cmd.lease_id, call_index=cmd.call_index)
+        return Decision(verdict="rewrite" if call != original else "forward", call=call)
+
+    def record_result(self, cmd: Command, result: ToolResult | Mapping[str, Any]) -> bool:
+        """Trusted arena callback, paired with a previously authorised command.
+
+        Parsing finishes before consuming the reservation. Failed/partial
+        results cannot supply a write precondition. No tool is called here.
+        """
+        pending = self._pending.get(cmd.cmd_id)
+        if not pending or pending[0].call_index != cmd.call_index:
+            return False
+        parsed = result if isinstance(result, ToolResult) else ToolResult.from_dict(result)
+        call = self._pending.pop(cmd.cmd_id)[0]
+        key = (call.server, call.tool)
+        if not parsed.ok:
+            if TOOL_SPECS[key].is_write:
+                self._provenance.pop(call.args.get("anchor"), None)
+            return True
+        if call.server == "registry" and call.tool == "provenance" and not parsed.partial and parsed.etag:
+            anchor = call.args.get("anchor")
+            if anchor in parsed.anchors:
+                self._provenance[anchor] = (parsed.etag, call.call_index, self.ctx.round, parsed.replica)
+        if parsed.lease_id and key == ("slides", "query"):
+            self._leases[parsed.lease_id] = (call.call_index, self.ctx.round)
+        if parsed.partial and parsed.continuation is not None:
+            self._partials[key] = (dict(call.args), parsed.continuation, self.ctx.round)
+        else:
+            self._partials.pop(key, None)
+        return True
+
+    def _sync_history(self) -> None:
+        """Consume arena-provided {command, outcome} history once, when present."""
+        history = self.ctx.history
+        for entry in history[self._history_count:]:
+            if not isinstance(entry, Mapping):
+                continue
+            cmd, outcome = entry.get("command"), entry.get("outcome")
+            if isinstance(cmd, Mapping):
+                values = dict(cmd)
+                values["fields"] = tuple(values.get("fields", ()))
+                cmd = Command(**values)
+            if isinstance(cmd, Command) and isinstance(outcome, (Mapping, ToolResult)):
+                self.record_result(cmd, outcome)
+        self._history_count = len(history)
 
     def deny(self, cmd: Command, reason: str) -> Decision:
         return Decision(verdict="deny", reason=reason)
